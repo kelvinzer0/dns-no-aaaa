@@ -8,7 +8,7 @@ RUN adduser -D dnsuser
 
 # Create app directory
 WORKDIR /app
-COPY dns_server.py ./
+COPY main.py ./
 
 # Change ownership to non-root user
 RUN chown dnsuser:dnsuser /app
@@ -24,7 +24,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD dig @127.0.0.1 google.com A +short || exit 1
 
 # Run the server
-CMD ["python", "dns_server.py"]
+CMD ["python", "main.py"]
 
 # Labels
 LABEL org.opencontainers.image.title="DNS No-AAAA"
