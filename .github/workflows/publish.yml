@@ -13,59 +13,51 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Cache Python dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install dnslib
-          sudo apt-get update -qq
-          sudo apt-get install -yq dnsutils netcat-openbsd
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir dnslib
 
-      - name: Prepare test environment
+      - name: Install system tools (if needed)
         run: |
-          # Stop conflicting services
+          # Only install if not available
+          command -v dig || sudo apt-get update -qq && sudo apt-get install -yq --no-upgrade dnsutils
+          command -v nc || sudo apt-get install -yq --no-upgrade netcat-openbsd
+
+      - name: Prepare environment
+        run: |
           sudo systemctl stop systemd-resolved 2>/dev/null || true
           sudo pkill -f "dnsmasq\|systemd-resolved" 2>/dev/null || true
-          sleep 1
 
-      - name: Run DNS server test
+      - name: Start DNS server
         run: |
-          # Start server in background
           python main.py --port ${{ env.DNS_PORT }} &
-          SERVER_PID=$!
-          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
           
-          # Wait for server to be ready
-          for i in {1..10}; do
-            if nc -z 127.0.0.1 ${{ env.DNS_PORT }}; then
-              echo "✅ Server is ready"
+          # Wait for server to start
+          for i in {1..15}; do
+            if nc -z 127.0.0.1 ${{ env.DNS_PORT }} 2>/dev/null; then
+              echo "✅ Server ready on port ${{ env.DNS_PORT }}"
               break
             fi
-            sleep 1
+            [ $i -eq 15 ] && { echo "❌ Server failed to start"; exit 1; }
+            sleep 0.5
           done
 
-      - name: Test DNS functionality
+      - name: Test DNS queries
         run: |
-          # Test A record (should work)
-          A_RESULT=$(dig @127.0.0.1 -p ${{ env.DNS_PORT }} google.com A +short +time=5)
+          echo "🧪 Testing DNS functionality..."
+          
+          # Test A record
+          A_RESULT=$(timeout 10 dig @127.0.0.1 -p ${{ env.DNS_PORT }} google.com A +short 2>/dev/null)
           if [ -n "$A_RESULT" ]; then
             echo "✅ A query: $A_RESULT"
           else
@@ -73,26 +65,28 @@ jobs:
             exit 1
           fi
           
-          # Test AAAA record (should be blocked)
-          AAAA_RESULT=$(dig @127.0.0.1 -p ${{ env.DNS_PORT }} google.com AAAA +short +time=5)
+          # Test AAAA record blocking
+          AAAA_RESULT=$(timeout 10 dig @127.0.0.1 -p ${{ env.DNS_PORT }} google.com AAAA +short 2>/dev/null)
           if [ -z "$AAAA_RESULT" ]; then
             echo "✅ AAAA blocking works"
           else
-            echo "❌ AAAA blocking failed: $AAAA_RESULT"
+            echo "❌ AAAA not blocked: $AAAA_RESULT"
             exit 1
           fi
+          
+          echo "🎉 All tests passed!"
 
       - name: Cleanup
         if: always()
         run: |
-          kill $SERVER_PID 2>/dev/null || true
+          [ -n "$SERVER_PID" ] && kill $SERVER_PID 2>/dev/null || true
           sudo systemctl start systemd-resolved 2>/dev/null || true
 
   build-and-push:
     if: github.ref == 'refs/heads/main'
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -106,24 +100,12 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: kelvinzer0/dns-no-aaaa
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix={{branch}}-
-
-      - name: Build and push Docker image
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: kelvinzer0/dns-no-aaaa:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64
