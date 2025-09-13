@@ -1,4 +1,4 @@
-name: Test and Publish DNS No-AAAA
+name: Test DNS No-AAAA
 
 on:
   push:
@@ -19,42 +19,65 @@ jobs:
       - name: Install dependencies
         run: pip install dnslib
 
-      - name: Run DNS server in background
+      - name: Stop system services that might use port 53
         run: |
-          python dns_server.py &
-          echo "SERVER_PID=$!" >> $GITHUB_ENV
-          sleep 3
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo pkill -f "dnsmasq" 2>/dev/null || true
+          sudo pkill -f "systemd-resolved" 2>/dev/null || true
+          sleep 2
 
-      - name: Wait for server on multiple ports
+      - name: Run DNS server with timeout
         run: |
-          for i in {1..10}; do
-            # Check all possible fallback ports
-            for port in 53 5353 5354 5355; do
-              if nc -z 127.0.0.1 $port; then
-                echo "✅ DNS server is ready on port $port"
-                echo "ACTIVE_PORT=$port" >> $GITHUB_ENV
-                exit 0
-              fi
-            done
-            echo "Waiting for DNS server... ($i/10)"
-            sleep 1
+          # Start server dengan timeout
+          timeout 30s python main.py &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+          sleep 5
+
+      - name: Check server status
+        run: |
+          # Cek jika server masih running
+          if ! ps -p $SERVER_PID > /dev/null; then
+            echo "❌ Server process died"
+            exit 1
+          fi
+          echo "✅ Server process is running"
+
+      - name: Find active port
+        run: |
+          # Cari port yang aktif
+          for port in 53 5353 5354 5355 5356 5357 5358 5359 5360; do
+            if nc -z -w 1 127.0.0.1 $port; then
+              echo "✅ Found server on port $port"
+              echo "ACTIVE_PORT=$port" >> $GITHUB_ENV
+              exit 0
+            fi
           done
-          echo "❌ DNS server failed to start on any port"
+          echo "❌ No active port found"
           exit 1
 
       - name: Test DNS functionality
         run: |
-          # Use the detected active port
-          for port in $ACTIVE_PORT 53 5353 5354 5355; do
-            if dig @127.0.0.1 -p $port google.com A +short; then
-              echo "✅ DNS working on port $port"
-              break
-            fi
-          done
+          # Test dengan port yang ditemukan
+          echo "Testing DNS on port $ACTIVE_PORT..."
           
-          # Test AAAA blocking
-          dig @127.0.0.1 -p $ACTIVE_PORT google.com AAAA +short
-          echo "✅ AAAA blocking working on port $ACTIVE_PORT"
+          # Test A query (should work)
+          if dig @127.0.0.1 -p $ACTIVE_PORT google.com A +short; then
+            echo "✅ A query working"
+          else
+            echo "❌ A query failed"
+            exit 1
+          fi
+          
+          # Test AAAA query (should be empty)
+          result=$(dig @127.0.0.1 -p $ACTIVE_PORT google.com AAAA +short)
+          if [ -z "$result" ]; then
+            echo "✅ AAAA blocking working"
+          else
+            echo "❌ AAAA blocking failed: $result"
+            exit 1
+          fi
 
       - name: Stop server
         run: |
@@ -77,6 +100,4 @@ jobs:
         uses: docker/build-push-action@v4
         with:
           push: true
-          tags: |
-            kelvinzer0/dns-no-aaaa:latest
-            kelvinzer0/dns-no-aaaa:${{ github.sha }}
+          tags: kelvinzer0/dns-no-aaaa:latest
