@@ -23,7 +23,7 @@ jobs:
         run: pip install dnslib
 
       - name: Run the DNS server in the background
-        run: python dns_server.py & echo "SERVER_PID=$!" >> $GITHUB_ENV
+        run: python main.py & echo "SERVER_PID=$!" >> $GITHUB_ENV
 
       - name: Wait for the server to be ready
         run: |
