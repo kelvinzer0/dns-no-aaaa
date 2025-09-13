@@ -5,61 +5,47 @@ import sys
 import time
 from dnslib import DNSRecord, DNSHeader, QTYPE
 
+
 class SimpleDNSFilter:
     def __init__(self, upstream_dns=None):
         self.upstream_dns = upstream_dns or os.getenv('UPSTREAM_DNS', '8.8.8.8')
         print(f"Using upstream DNS: {self.upstream_dns}")
     
     def handle_dns_request(self, data):
-    try:
-        request = DNSRecord.parse(data)
-        
-        # Check for AAAA queries atau ANY queries
-        has_aaaa_query = False
-        for question in request.questions:
-            if question.qtype == QTYPE.AAAA or question.qtype == QTYPE.ANY:
-                print(f"🚫 Blocked AAAA/ANY query: {question.qname} (type: {QTYPE[question.qtype]})")
-                has_aaaa_query = True
-                # Untuk query AAAA atau ANY, kita perlu memberikan response khusus
-                if question.qtype == QTYPE.AAAA:
-                    # Return empty response untuk AAAA
-                    response = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), 
-                                       q=question)
-                    return response.pack()
-        
-        # Jika query ANY, kita perlu memfilter record AAAA dari response upstream
-        if has_aaaa_query:
-            # Forward ke upstream DNS
+        try:
+            request = DNSRecord.parse(data)
+            
+            # Check for AAAA queries or ANY queries
+            has_aaaa_related_query = False
+            for question in request.questions:
+                if question.qtype in [QTYPE.AAAA, QTYPE.ANY]:
+                    print(f"🚫 Blocked AAAA/ANY query: {question.qname}")
+                    has_aaaa_related_query = True
+                    break
+            
+            # Forward to upstream DNS
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.settimeout(5)
                 sock.sendto(data, (self.upstream_dns, 53))
-                response_data, _ = sock.recvfrom(4096)  # Perbesar buffer
+                response_data, _ = sock.recvfrom(4096)  # Increased buffer size
             
-            # Parse response dari upstream
-            upstream_response = DNSRecord.parse(response_data)
+            # If query is related to AAAA, filter the response
+            if has_aaaa_related_query:
+                response = DNSRecord.parse(response_data)
+                
+                # Filter all sections: answer, authority, additional
+                response.rr = [rr for rr in response.rr if rr.rtype != QTYPE.AAAA]
+                response.auth = [rr for rr in response.auth if rr.rtype != QTYPE.AAAA]
+                response.ar = [rr for rr in response.ar if rr.rtype != QTYPE.AAAA]
+                
+                return response.pack()
             
-            # Hapus semua record AAAA dari answer section
-            filtered_answers = []
-            for rr in upstream_response.rr:
-                if rr.rtype != QTYPE.AAAA:
-                    filtered_answers.append(rr)
+            return response_data
             
-            # Ganti answer section dengan yang sudah difilter
-            upstream_response.rr = filtered_answers
-            
-            return upstream_response.pack()
-        
-        # Untuk query lainnya, forward biasa
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(5)
-            sock.sendto(data, (self.upstream_dns, 53))
-            response_data, _ = sock.recvfrom(1024)
-        
-        return response_data
-        
-    except Exception as e:
-        print(f"Error handling DNS request: {e}")
-        return data
+        except Exception as e:
+            print(f"Error handling DNS request: {e}")
+            return data
+
 
 def create_udp_socket():
     """Create UDP socket dengan fallback ke higher ports"""
@@ -86,8 +72,9 @@ def create_udp_socket():
                 
                 if port == ports_to_try[-1]:
                     raise Exception(f"Failed to bind UDP to any port: {ports_to_try}")
-                
+    
     raise Exception("No UDP ports available")
+
 
 def create_tcp_socket():
     """Create TCP socket dengan fallback"""
@@ -120,17 +107,18 @@ def create_tcp_socket():
     
     return None, None
 
+
 def udp_server():
     """UDP server dengan comprehensive error handling"""
     try:
         sock, actual_port = create_udp_socket()
-        filter = SimpleDNSFilter()
+        dns_filter = SimpleDNSFilter()
         
         print(f"✅ UDP DNS server running on port {actual_port}")
         while True:
             try:
                 data, addr = sock.recvfrom(512)
-                response = filter.handle_dns_request(data)
+                response = dns_filter.handle_dns_request(data)
                 sock.sendto(response, addr)
             except Exception as e:
                 print(f"UDP processing error: {e}")
@@ -141,6 +129,7 @@ def udp_server():
         print("💡 Tips: Try running with sudo or use different ports")
         sys.exit(1)
 
+
 def tcp_server():
     """TCP server - optional"""
     try:
@@ -149,7 +138,7 @@ def tcp_server():
             print("⚠️ TCP server unavailable, UDP only mode")
             return
         
-        filter = SimpleDNSFilter()
+        dns_filter = SimpleDNSFilter()
         
         print(f"✅ TCP DNS server running on port {actual_port}")
         while True:
@@ -157,8 +146,10 @@ def tcp_server():
                 conn, addr = sock.accept()
                 data = conn.recv(1024)
                 if data:
+                    # Remove TCP length prefix (2 bytes)
                     dns_data = data[2:] if len(data) > 2 else data
-                    response = filter.handle_dns_request(dns_data)
+                    response = dns_filter.handle_dns_request(dns_data)
+                    # Add TCP length prefix back
                     conn.send(b"\x00" + bytes([len(response)]) + response)
                 conn.close()
             except Exception as e:
@@ -169,6 +160,7 @@ def tcp_server():
         print(f"⚠️ TCP server error: {e}")
         # Don't exit, UDP is main service
 
+
 def check_server_ready(port):
     """Check if server is ready to accept connections"""
     try:
@@ -178,6 +170,7 @@ def check_server_ready(port):
             return True
     except:
         return False
+
 
 if __name__ == '__main__':
     print("🚀 Starting DNS No-AAAA Server...")
