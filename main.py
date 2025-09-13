@@ -1,11 +1,11 @@
 import socket
 import threading
 import os
+import sys
 from dnslib import DNSRecord, DNSHeader, QTYPE
 
 class SimpleDNSFilter:
     def __init__(self, upstream_dns=None):
-        # Use custom upstream DNS or default to 8.8.8.8
         self.upstream_dns = upstream_dns or os.getenv('UPSTREAM_DNS', '8.8.8.8')
         print(f"Using upstream DNS: {self.upstream_dns}")
     
@@ -32,55 +32,104 @@ class SimpleDNSFilter:
             
         except Exception as e:
             print(f"Error handling DNS request: {e}")
-            # Return empty response on error
             return data
 
+def create_udp_socket():
+    """Create UDP socket with fallback from port 53 to 5353"""
+    ports_to_try = [53, 5353, 5354, 5355]
+    
+    for port in ports_to_try:
+        try:
+            # Try IPv6 socket (supports both IPv4 and IPv6)
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.bind(('::', port))
+            print(f"✅ UDP successfully bound to port {port}")
+            return sock, port
+        except OSError as e:
+            print(f"❌ Cannot bind UDP to port {port}: {e}")
+            if port == ports_to_try[-1]:
+                raise Exception(f"Failed to bind UDP to any port: {ports_to_try}")
+            print(f"🔄 Trying next port: {ports_to_try[ports_to_try.index(port) + 1]}")
+    
+    raise Exception("No UDP ports available")
+
+def create_tcp_socket():
+    """Create TCP socket with fallback from port 53 to 5353"""
+    ports_to_try = [53, 5353, 5354, 5355]
+    
+    for port in ports_to_try:
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.bind(('::', port))
+            sock.listen(5)
+            print(f"✅ TCP successfully bound to port {port}")
+            return sock, port
+        except OSError as e:
+            print(f"❌ Cannot bind TCP to port {port}: {e}")
+            if port == ports_to_try[-1]:
+                print("⚠️ TCP server failed, continuing with UDP only")
+                return None, None
+            print(f"🔄 Trying next TCP port: {ports_to_try[ports_to_try.index(port) + 1]}")
+    
+    print("⚠️ TCP server unavailable, continuing with UDP only")
+    return None, None
+
 def udp_server():
-    """UDP server for both IPv4 and IPv6"""
+    """UDP server with port fallback"""
     try:
-        # IPv6 socket can handle both IPv4 and IPv6 connections
-        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        sock.bind(('::', 53))
+        sock, actual_port = create_udp_socket()
         filter = SimpleDNSFilter()
         
-        print("✅ UDP DNS server running on [::]:53 (IPv4 & IPv6)")
+        print(f"✅ UDP DNS server running on [::]:{actual_port} (IPv4 & IPv6)")
         while True:
             try:
                 data, addr = sock.recvfrom(512)
                 response = filter.handle_dns_request(data)
                 sock.sendto(response, addr)
             except Exception as e:
-                print(f"UDP error: {e}")
+                print(f"UDP processing error: {e}")
                 
     except Exception as e:
-        print(f"Failed to start UDP server: {e}")
+        print(f"❌ Failed to start UDP server: {e}")
+        sys.exit(1)
 
 def tcp_server():
-    """TCP server for both IPv4 and IPv6"""
+    """TCP server with port fallback"""
     try:
-        # IPv6 socket can handle both IPv4 and IPv6 connections
-        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        sock.bind(('::', 53))
-        sock.listen(5)
+        sock, actual_port = create_tcp_socket()
+        if sock is None:
+            return  # TCP not available, skip quietly
+        
         filter = SimpleDNSFilter()
         
-        print("✅ TCP DNS server running on [::]:53 (IPv4 & IPv6)")
+        print(f"✅ TCP DNS server running on [::]:{actual_port} (IPv4 & IPv6)")
         while True:
             try:
                 conn, addr = sock.accept()
                 data = conn.recv(1024)
                 if data:
-                    # Remove TCP length prefix (2 bytes)
                     dns_data = data[2:] if len(data) > 2 else data
                     response = filter.handle_dns_request(dns_data)
-                    # Add TCP length prefix
                     conn.send(b"\x00" + bytes([len(response)]) + response)
                 conn.close()
             except Exception as e:
-                print(f"TCP error: {e}")
+                print(f"TCP processing error: {e}")
                 
     except Exception as e:
-        print(f"Failed to start TCP server: {e}")
+        print(f"⚠️ TCP server error: {e}")
+        # Don't exit, UDP is main service
+
+def get_active_ports():
+    """Get list of ports that are actually listening"""
+    active_ports = []
+    for port in [53, 5353, 5354, 5355]:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as test_sock:
+                test_sock.connect(('127.0.0.1', port))
+                active_ports.append(port)
+        except:
+            pass
+    return active_ports
 
 if __name__ == '__main__':
     print("🚀 Starting DNS No-AAAA Server...")
@@ -95,11 +144,19 @@ if __name__ == '__main__':
     udp_thread.start()
     tcp_thread.start()
     
-    print("✅ DNS No-AAAA server started successfully!")
-    print("📡 Listening on:")
-    print("   - UDP: [::]:53 (IPv4 & IPv6)")
-    print("   - TCP: [::]:53 (IPv4 & IPv6)")
-    print("🔍 Ready to block AAAA queries!")
+    # Wait a bit for servers to start
+    import time
+    time.sleep(2)
+    
+    # Display active ports
+    active_ports = get_active_ports()
+    if active_ports:
+        print(f"✅ DNS No-AAAA server started successfully!")
+        print(f"📡 Listening on ports: {', '.join(map(str, active_ports))}")
+        print("🔍 Ready to block AAAA queries!")
+    else:
+        print("❌ No ports available for listening")
+        sys.exit(1)
     
     # Keep main thread alive
     try:
