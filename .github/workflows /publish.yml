@@ -1,0 +1,130 @@
+name: Test and Publish DNS No-AAAA to Docker Hub
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install dnslib
+
+      - name: Run the DNS server in the background
+        run: python dns_server.py & echo "SERVER_PID=$!" >> $GITHUB_ENV
+
+      - name: Wait for the server to be ready
+        run: |
+          for i in {1..10}; do
+            if nc -z 127.0.0.1 53; then
+              echo "DNS server is ready on port 53."
+              exit 0
+            fi
+            echo "Waiting for DNS server... ($i/10)"
+            sleep 1
+          done
+          echo "DNS server did not start in time."
+          exit 1
+
+      - name: Test DNS functionality
+        run: |
+          # Test AAAA query (should be blocked)
+          echo "Testing AAAA query blocking..."
+          result=$(dig @127.0.0.1 google.com AAAA +short)
+          if [ -z "$result" ]; then
+            echo "✅ AAAA blocking works correctly"
+          else
+            echo "❌ AAAA blocking failed"
+            exit 1
+          fi
+
+          # Test A query (should work normally)
+          echo "Testing A query forwarding..."
+          result=$(dig @127.0.0.1 google.com A +short)
+          if [ -n "$result" ]; then
+            echo "✅ A query forwarding works correctly"
+          else
+            echo "❌ A query forwarding failed"
+            exit 1
+          fi
+
+      - name: Stop the DNS server
+        run: kill $SERVER_PID || true
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            kelvinzer0/dns-no-aaaa
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: kelvinzer0/dns-no-aaaa
+          readme-file: README.md
+
+  release:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            Dockerfile
+            dns_server.py
+            README.md
+          generate_release_notes: true
