@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  dns-no-aaaa:
+    build: .
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    environment:
+      - UPSTREAM_DNS=8.8.8.8
+      - DEBUG=false
+    cap_add:
+      - NET_BIND_SERVICE
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "dig", "@127.0.0.1", "google.com", "A", "+short"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
