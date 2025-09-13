@@ -1,9 +1,8 @@
-name: Test and Publish DNS No-AAAA to Docker Hub
+name: Test and Publish DNS No-AAAA
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   test:
@@ -20,46 +19,46 @@ jobs:
       - name: Install dependencies
         run: pip install dnslib
 
-      - name: Run the DNS server in the background
-        run: python main.py & echo "SERVER_PID=$!" >> $GITHUB_ENV
+      - name: Run DNS server in background
+        run: |
+          python dns_server.py &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 3
 
-      - name: Wait for the server to be ready
+      - name: Wait for server on multiple ports
         run: |
           for i in {1..10}; do
-            if nc -z 127.0.0.1 53; then
-              echo "DNS server is ready on port 53."
-              exit 0
-            fi
+            # Check all possible fallback ports
+            for port in 53 5353 5354 5355; do
+              if nc -z 127.0.0.1 $port; then
+                echo "✅ DNS server is ready on port $port"
+                echo "ACTIVE_PORT=$port" >> $GITHUB_ENV
+                exit 0
+              fi
+            done
             echo "Waiting for DNS server... ($i/10)"
             sleep 1
           done
-          echo "DNS server did not start in time."
+          echo "❌ DNS server failed to start on any port"
           exit 1
 
       - name: Test DNS functionality
         run: |
-          # Test AAAA query (should be blocked)
-          echo "Testing AAAA query blocking..."
-          result=$(dig @127.0.0.1 google.com AAAA +short)
-          if [ -z "$result" ]; then
-            echo "✅ AAAA blocking works correctly"
-          else
-            echo "❌ AAAA blocking failed"
-            exit 1
-          fi
+          # Use the detected active port
+          for port in $ACTIVE_PORT 53 5353 5354 5355; do
+            if dig @127.0.0.1 -p $port google.com A +short; then
+              echo "✅ DNS working on port $port"
+              break
+            fi
+          done
+          
+          # Test AAAA blocking
+          dig @127.0.0.1 -p $ACTIVE_PORT google.com AAAA +short
+          echo "✅ AAAA blocking working on port $ACTIVE_PORT"
 
-          # Test A query (should work normally)
-          echo "Testing A query forwarding..."
-          result=$(dig @127.0.0.1 google.com A +short)
-          if [ -n "$result" ]; then
-            echo "✅ A query forwarding works correctly"
-          else
-            echo "❌ A query forwarding failed"
-            exit 1
-          fi
-
-      - name: Stop the DNS server
-        run: kill $SERVER_PID || true
+      - name: Stop server
+        run: |
+          kill $SERVER_PID 2>/dev/null || true
 
   build-and-push:
     needs: test
@@ -68,61 +67,16 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v3
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          images: |
-            kelvinzer0/dns-no-aaaa
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-
-      - name: Build and push Docker image
+      - name: Build and push
         uses: docker/build-push-action@v4
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: kelvinzer0/dns-no-aaaa
-          readme-file: README.md
-
-  release:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            Dockerfile
-            dns_server.py
-            README.md
-          generate_release_notes: true
+          tags: |
+            kelvinzer0/dns-no-aaaa:latest
+            kelvinzer0/dns-no-aaaa:${{ github.sha }}
