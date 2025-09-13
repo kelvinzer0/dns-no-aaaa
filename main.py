@@ -11,29 +11,55 @@ class SimpleDNSFilter:
         print(f"Using upstream DNS: {self.upstream_dns}")
     
     def handle_dns_request(self, data):
-        try:
-            request = DNSRecord.parse(data)
-            
-            # Check for AAAA queries
-            for question in request.questions:
+    try:
+        request = DNSRecord.parse(data)
+        
+        # Check for AAAA queries atau ANY queries
+        has_aaaa_query = False
+        for question in request.questions:
+            if question.qtype == QTYPE.AAAA or question.qtype == QTYPE.ANY:
+                print(f"🚫 Blocked AAAA/ANY query: {question.qname} (type: {QTYPE[question.qtype]})")
+                has_aaaa_query = True
+                # Untuk query AAAA atau ANY, kita perlu memberikan response khusus
                 if question.qtype == QTYPE.AAAA:
-                    print(f"🚫 Blocked AAAA: {question.qname}")
-                    # Return empty response for AAAA
+                    # Return empty response untuk AAAA
                     response = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), 
                                        q=question)
                     return response.pack()
-            
-            # Forward other queries to upstream DNS
+        
+        # Jika query ANY, kita perlu memfilter record AAAA dari response upstream
+        if has_aaaa_query:
+            # Forward ke upstream DNS
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.settimeout(5)
                 sock.sendto(data, (self.upstream_dns, 53))
-                response_data, _ = sock.recvfrom(1024)
+                response_data, _ = sock.recvfrom(4096)  # Perbesar buffer
             
-            return response_data
+            # Parse response dari upstream
+            upstream_response = DNSRecord.parse(response_data)
             
-        except Exception as e:
-            print(f"Error handling DNS request: {e}")
-            return data
+            # Hapus semua record AAAA dari answer section
+            filtered_answers = []
+            for rr in upstream_response.rr:
+                if rr.rtype != QTYPE.AAAA:
+                    filtered_answers.append(rr)
+            
+            # Ganti answer section dengan yang sudah difilter
+            upstream_response.rr = filtered_answers
+            
+            return upstream_response.pack()
+        
+        # Untuk query lainnya, forward biasa
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(5)
+            sock.sendto(data, (self.upstream_dns, 53))
+            response_data, _ = sock.recvfrom(1024)
+        
+        return response_data
+        
+    except Exception as e:
+        print(f"Error handling DNS request: {e}")
+        return data
 
 def create_udp_socket():
     """Create UDP socket dengan fallback ke higher ports"""
